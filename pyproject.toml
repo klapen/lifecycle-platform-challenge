@@ -1,0 +1,26 @@
+[project]
+name = "lifecycle-platform-challenge"
+version = "0.1.0"
+description = "Marketing campaign pipeline — audience selection, send orchestration, and observability"
+readme = "README.md"
+authors = [
+    { name = "orlando", email = "osaavedra@bora.com.co" }
+]
+requires-python = ">=3.12"
+dependencies = [
+    "requests>=2.33.1",
+]
+
+[build-system]
+requires = ["uv_build>=0.11.7,<0.12.0"]
+build-backend = "uv_build"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+
+[dependency-groups]
+dev = [
+    "pytest>=9.0.3",
+    "pytest-mock>=3.15.1",
+]
