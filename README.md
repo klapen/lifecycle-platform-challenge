@@ -1,165 +1,123 @@
-# Campaign Pipeline — System Design Overview
+# lifecycle-platform-challenge
 
-This repository contains a **system design for a production-ready marketing campaign pipeline**, focused on:
-
-- Data-driven audience selection
-- Reliable pipeline orchestration
-- Safe message delivery
-- Integration with predictive models
-- Observability and operational robustness
-
-The goal is to demonstrate how to design a **deterministic, idempotent, and scalable pipeline** that integrates data engineering, backend systems, and ML outputs.
+A production-oriented marketing campaign pipeline covering audience selection, reliable message delivery, Airflow orchestration, ML model integration, and observability.
 
 ---
 
-## System Overview
+## How to run locally
 
-The system is composed of the following logical components:
+**Requirements:** Python 3.11+, [`uv`](https://github.com/astral-sh/uv)
 
-1. **BigQuery Layer**
-   - Defines the campaign audience
-   - Applies business rules and filters
-   - Integrates predictive model scores
+```bash
+# Install dependencies
+uv sync
 
-2. **Airflow DAG**
-   - Orchestrates the end-to-end pipeline
-   - Manages dependencies, retries, and scheduling
-   - Ensures deterministic execution
+# Run the full test suite
+uv run pytest
 
-3. **Pipeline Orchestration Layer**
-   - Handles batching, retries, and rate limiting
-   - Ensures idempotent message delivery
-   - Integrates with external messaging providers
+# Run a single test
+uv run pytest tests/test_send.py::test_dedup_filters_already_sent
+```
 
-4. **Value Model Integration**
-   - Filters audience using ML predictions
-   - Supports multiple models and configurable thresholds
-   - Handles model availability and freshness
-
-5. **Observability Layer**
-   - Tracks execution metrics and outcomes
-   - Provides logging and alerting
-   - Enables debugging and auditing
+No Airflow or GCP credentials are needed to run the tests — the DAG tests use a minimal Airflow mock (`tests/airflow_mock.py`) that operates without installing `apache-airflow`.
 
 ---
 
-## Repository Structure
+## Repository structure
 
 ```
 .
-├── docs
-│   ├── airflow.md
+├── docs/                  # Exercise prompts and design inputs (read-only context)
 │   ├── bigquery.md
-│   ├── observability.md
 │   ├── pipeline-orchestration.md
-│   └── value-model.md
-└── README.md
+│   ├── airflow.md
+│   ├── value-model.md
+│   └── observability.md
+├── output/                # Design-only deliverables (Parts 4 & 5)
+│   ├── value-model-integration.md
+│   └── observability.md
+├── src/
+│   └── lifecycle_platform_challenge/
+│       ├── sql/
+│       │   └── audience.sql          # Part 1: parameterized BigQuery audience query
+│       ├── pipeline/
+│       │   ├── send.py               # Part 2: execute_campaign_send()
+│       │   ├── dedup.py              # Sent-log persistence
+│       │   ├── esp.py                # ESP client stub
+│       │   ├── response.py           # HTTP response classification
+│       │   └── logger.py             # Structured batch logger
+│       └── dags/
+│           ├── campaign_dag.py       # Part 3: Airflow DAG wiring
+│           └── tasks/
+│               ├── build_audience.py
+│               ├── validate_audience.py
+│               ├── send_campaign.py
+│               └── notify.py
+├── tests/
+│   ├── airflow_mock.py    # Minimal Airflow mock for structural DAG tests
+│   ├── test_audience_sql.py
+│   ├── test_send.py
+│   ├── test_dedup.py
+│   ├── test_response.py
+│   └── test_dag.py
+└── ai-session/            # Claude Code session export (see submission instructions)
 ```
 
-Each document contains:
-- The original problem context
-- Design assumptions
-- Key decisions
-- Tradeoffs and limitations
+---
+
+## Assumptions made
+
+- **`run_date` is the single time anchor** sourced from Airflow's `logical_date`. No `CURRENT_TIMESTAMP()` or `datetime.now()` anywhere — all time windows resolve against `run_date` in UTC.
+- **Idempotency key is `campaign_id + renter_id`**, enforced client-side via a file-based `sent_renters.json`. The exercise acknowledges this is not production-safe for distributed workers (a BigQuery `MERGE` or Redis SET would replace it).
+- **Audience is materialized once per `run_date`** to a BigQuery staging table. Downstream tasks read that snapshot — they do not re-run the query.
+- **ESP provides no idempotency guarantees.** The pipeline implements its own dedup layer; an Iterable-like ESP is assumed.
+- **ML model dependency is soft.** The bounded-waiting strategy (up to 60 min) prioritises operational reliability over targeting quality — the explicit tradeoff is: waiting too long risks the SLA, sending without scores wastes SMS volume, and not sending at all loses revenue.
+- **Renters without a model score are excluded** from the ML-filtered audience (no fallback score assigned).
+- **`validate_audience` is a hard gate** — `count == 0` raises `AirflowSkipException`, `count > 2× historical avg` raises `AirflowFailException`. Neither proceeds to send.
 
 ---
 
-## Design Principles
+## Design decisions and tradeoffs
 
-### Determinism
-- All executions are based on a fixed `run_date`
-- Results must be reproducible across retries and reruns
-
----
-
-### Idempotency
-- No user should receive the same campaign twice
-- All side effects (e.g., message sends) are protected against duplication
-
----
-
-### Separation of Concerns
-- BigQuery → data processing
-- Airflow → orchestration
-- Python modules → external integrations
+| Decision | Rationale | Tradeoff |
+|---|---|---|
+| Audience materialized to staging table | Downstream tasks see a stable snapshot; retries are safe | Extra BQ storage cost per run |
+| XCom carries only metadata (not rows) | Keeps XCom small; audience rows stay in BQ | Requires an extra COUNT query in `build_audience` |
+| File-based dedup (`sent_renters.json`) | Simple, no extra infrastructure | Not safe for distributed workers |
+| Circuit breaker on consecutive batch failures | Stops wasting retries against a dead ESP | May abort a run that would have self-healed |
+| ML as soft dependency with bounded waiting | Preserves SLA even if scoring job is late | May send unfiltered if scores never arrive |
+| Per-batch persistence (not end-of-run) | Crash loses at most one in-flight batch | More disk I/O; more BQ writes |
 
 ---
 
-### Materialization Over Recalculation
-- Intermediate results (audience) are persisted
-- Downstream steps operate on stable snapshots
+## How it would differ with more time
+
+- **Distributed dedup backend** — replace the file-based `sent_renters.json` with an atomic BigQuery `MERGE` or a Redis SET so the dedup layer is safe across multiple Airflow workers.
+- **Provider-level idempotency keys** — pass a deterministic key (`campaign_id + renter_id + run_date`) to the ESP on each request to let the provider deduplicate on its side.
+- **Smarter ML fallback** — instead of send-all or skip, introduce a "send to high-confidence-only" tier: apply a higher threshold when full scores aren't available rather than a binary send/skip.
+- **Partitioned staging tables** — partition `audience_{campaign_id}` by `run_date` and add a retention policy rather than `CREATE OR REPLACE TABLE` each day.
+- **Integration tests against real BigQuery** — the SQL tests today validate structure; a test with a real (or emulated) BQ instance would validate the query logic against actual data distributions.
+- **Datadog DogStatsD instrumentation** — the observability design (Part 5) is currently spec-only; the actual `statsd.increment()` / `statsd.gauge()` calls would be added to each task.
+- **Airflow `BigQueryTablePartitionExistenceSensor`** with `mode="reschedule"` as an alternative to the retry-loop freshness check, to release worker slots between polls.
 
 ---
 
-### Resilience
-- Supports retries, partial failures, and rate limiting
-- Ensures forward progress even under failure conditions
+## AI usage notes
+
+- **`docs/` as AI reference material.** The files under `docs/` were written as structured inputs for the AI — problem statements, schemas, constraints, and design considerations — rather than as user-facing documentation. They also serve as a durable plan for future tuning: if a design decision needs to be revisited, the relevant `docs/` file is the starting point.
+
+- **Per-step plan files to reduce token consumption.** `docs/plan/` contains one file per implementation step (e.g., `01-bigquery.md`, `02-send-pipeline.md`). Each file is self-contained so the AI only needs to load the context relevant to the current step, rather than the full project history. This significantly reduces token usage and keeps responses focused.
+
+- **Cross-validated with ChatGPT.** Several design outputs (Parts 4 and 5) and the prompts used to generate them were cross-checked with ChatGPT — running the same questions in both tools and using the differences to surface gaps or weak assumptions. Prompt wording was also iteratively refined using ChatGPT to get clearer, more precise outputs from Claude Code.
 
 ---
 
-### Configurability
-- Campaign parameters (thresholds, models, batching) are configurable
-- Avoids hardcoded logic to support future extensions
+## Parts overview
 
----
-
-### Scalability
-- Designed to handle large datasets efficiently
-- Uses BigQuery for heavy computation and filtering
-
----
-
-## Key Challenges Addressed
-
-- Ensuring **consistent audience selection** despite changing data
-- Handling **external API limitations** (rate limits, retries, failures)
-- Preventing **duplicate message delivery**
-- Managing **dependencies between data pipelines (ML → campaign)**
-- Balancing **business tradeoffs** (accuracy vs timeliness)
-- Supporting **future extensibility** (multiple models, segments)
-
----
-
-## Business Context
-
-The system is designed for **campaign-based user engagement**, where:
-
-- Targeting accuracy directly impacts ROI
-- Timing is critical (daily scheduled campaigns)
-- External providers introduce uncertainty
-- Data and ML pipelines must be coordinated
-
----
-
-## How to Use This Repository
-
-- Start with `docs/bigquery.md` to understand audience definition
-- Continue with `docs/pipeline-orchestration.md` for delivery logic
-- Review `docs/airflow.md` for orchestration design
-- Explore `docs/value-model.md` for ML integration
-- Finish with `docs/observability.md` for monitoring and reliability
-
----
-
-## Scope & Limitations
-
-This design intentionally simplifies certain aspects for clarity:
-
-- File-based deduplication instead of distributed storage
-- No transactional guarantees between send and logging
-- No provider-level idempotency keys
-- Simplified ML pipeline dependency handling
-
-These are acknowledged tradeoffs for the purpose of the exercise and would be addressed in a production system.
-
----
-
-## Final Note
-
-This repository focuses on **how to think about building reliable systems**, not just how to implement them.
-
-The emphasis is on:
-- making assumptions explicit
-- designing for failure
-- balancing technical and business constraints
-```
+| Part | Type | Location |
+|---|---|---|
+| 1 — Audience SQL | Implemented | `src/lifecycle_platform_challenge/sql/audience.sql` |
+| 2 — Send pipeline | Implemented | `src/lifecycle_platform_challenge/pipeline/` |
+| 3 — Airflow DAG | Implemented | `src/lifecycle_platform_challenge/dags/` |
+| 4 — ML integration | Design | `output/value-model-integration.md` |
+| 5 — Observability | Design | `output/observability.md` |
