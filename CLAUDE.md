@@ -32,6 +32,11 @@ These constraints recur across the SQL, Python, and DAG code — changing one us
 - **Validation gate before send:** `audience_count > 0` AND `audience_count <= 2× historical average`. Failure stops the pipeline and notifies — does not proceed to send.
 - **ML score dependency is *soft* with bounded waiting** (30–60 min), not a hard block. The business tradeoff (wasted SMS volume vs. lost revenue) is the rationale — preserve it when editing Part 4.
 
+## Code Style
+
+- **One file per concern.** Split modules by single responsibility — logger, HTTP response handling, persistence, orchestration each get their own file. Do not consolidate into one large module even when the total line count is small. Propose the split upfront.
+- **Parametrize tests when applicable.** Use `@pytest.mark.parametrize` whenever a test covers the same logic across multiple inputs (e.g. status codes, retryable vs non-retryable cases, boundary values). Prefer parametrized tests over duplicated test functions.
+
 ## Editing Conventions for `output/`
 
 - Mirror the structure of `docs/` files: original problem statement verbatim at the top, followed by a numbered assumptions/design-decisions section (`### 1. Title`, `### 2. Title`, ...) separated by `---` rules.
