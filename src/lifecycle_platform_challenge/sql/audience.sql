@@ -56,8 +56,7 @@ qualified_profiles AS (
         renter_id,
         email,
         phone,
-        last_login,
-        dnd_until
+        last_login
     FROM
         renter_profiles
     WHERE
@@ -67,7 +66,10 @@ qualified_profiles AS (
         -- Phone must be present and non-empty.
         AND phone IS NOT NULL
         AND TRIM(phone) != ''
-        -- NULL last_login does not qualify as "inactive for 30 days".
+        -- "Inactive for 30+ days" is enforced at date-level granularity:
+        -- last_login must be before midnight UTC of the day 30 days before run_date.
+        -- A renter who logged in at 23:59 UTC on that day is excluded.
+        -- This is intentional — day-level semantics match the run_date anchor.
         AND last_login IS NOT NULL
         AND last_login < TIMESTAMP(DATE_SUB(@run_date, INTERVAL 30 DAY))
         -- DATE() comparison matches the source doc intent: "dnd_until < run_date"
