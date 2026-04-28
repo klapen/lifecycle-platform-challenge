@@ -18,11 +18,13 @@ def _chunked(items: list, size: int) -> Iterator[list]:
 
 
 def _compute_backoff(attempt: int, retry_after: float | None) -> float:
-    jitter = random.uniform(0, 1)
+    # Jitter proportional to the delay window to spread retries across the full interval.
+    exponential = BASE_DELAY * (2**attempt)
+    jitter = random.uniform(0, exponential)
     if retry_after is not None:
-        # Respect the server's directive; add jitter to avoid thundering herd.
-        return retry_after + jitter
-    return BASE_DELAY * (2**attempt) + jitter
+        # Respect the server's directive; small jitter avoids thundering herd on resume.
+        return retry_after + random.uniform(0, 1)
+    return exponential + jitter
 
 
 def _extract_retry_after(response) -> float | None:
@@ -98,10 +100,15 @@ def execute_campaign_send(
         success = _send_batch_with_retries(esp_client, campaign_id, batch, logger)
         if success:
             batch_ids = [r["renter_id"] for r in batch]
-            # Persist per-batch: a mid-run crash loses at most the current
-            # in-flight batch, not all progress since the run started.
-            persist_sent(sent_log_path, campaign_id, batch_ids)
-            total_sent += len(batch)
+            try:
+                # Persist per-batch: a mid-run crash loses at most the current
+                # in-flight batch, not all progress since the run started.
+                persist_sent(sent_log_path, campaign_id, batch_ids)
+                total_sent += len(batch)
+            except Exception as exc:
+                # Sent to ESP but log write failed — recipients may be re-sent on retry.
+                logger.persist_failed(exc=exc, batch_size=len(batch))
+                total_failed += len(batch)
         else:
             logger.batch_dropped(batch_size=len(batch))
             total_failed += len(batch)

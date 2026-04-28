@@ -153,7 +153,10 @@ def test_elapsed_seconds(tmp_path):
     assert result["elapsed_seconds"] == pytest.approx(1.5)
 
 
-def test_atomic_persistence_on_replace_failure(tmp_path):
+def test_persist_failure_counts_batch_as_failed_and_pipeline_continues(tmp_path):
+    # Both batches are sent successfully to the ESP. The second persist fails.
+    # The pipeline must not abort — the second batch is counted as failed (duplicate
+    # risk on retry is logged), and the first batch's ids remain on disk untouched.
     log = str(tmp_path / "sent.json")
     audience = _audience(200)
     esp = _client(_resp(200), _resp(200))
@@ -164,13 +167,16 @@ def test_atomic_persistence_on_replace_failure(tmp_path):
     def fail_on_second(src, dst):
         call_count["n"] += 1
         if call_count["n"] == 2:
-            raise OSError("simulated crash")
+            raise OSError("simulated disk full")
         return original_replace(src, dst)
 
     with patch("lifecycle_platform_challenge.pipeline.dedup.os.replace", side_effect=fail_on_second):
-        with pytest.raises(OSError, match="simulated crash"):
-            execute_campaign_send("cmp1", audience, esp, log)
+        result = execute_campaign_send("cmp1", audience, esp, log)
 
+    # Pipeline completed — did not raise.
+    assert result["total_sent"] == 100
+    assert result["total_failed"] == 100
+
+    # First batch's write succeeded; file is intact and unmodified by the failed second write.
     data = json.loads(open(log).read())
-    assert len(data["cmp1"]) == 100
     assert set(data["cmp1"]) == {r["renter_id"] for r in audience[:100]}

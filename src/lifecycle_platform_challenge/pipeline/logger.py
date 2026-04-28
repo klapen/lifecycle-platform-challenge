@@ -47,3 +47,10 @@ class BatchLogger:
             "batch_dropped campaign_id=%s batch_size=%d",
             self._campaign_id, batch_size,
         )
+
+    def persist_failed(self, *, exc: Exception, batch_size: int) -> None:
+        # Sent to ESP but not recorded — these recipients risk a duplicate on retry.
+        self._log.error(
+            "persist_failed campaign_id=%s batch_size=%d error=%s duplicate_risk=true",
+            self._campaign_id, batch_size, exc,
+        )
